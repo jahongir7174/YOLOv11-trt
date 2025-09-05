@@ -78,8 +78,7 @@ Pretrained weights and engines are provided in the `weights/` directory:
 ## Code Overview
 - **main.py**: Handles argument parsing, ONNX export, engine build, benchmarking, and inference.
 - **nets/nn.py**: Defines YOLOv11 model variants, backbone, FPN, head, and export/fuse utilities.
-- **utils/dataset.py**: Implements dataset loading, augmentation (mosaic, mixup, HSV, flipping, perspective), and label parsing.
-- **utils/util.py**: Contains metrics, loss functions, plotting, learning rate schedulers, and other utilities.
+- **utils/util.py**: Contains other utilities.
 
 ## References
 - [YOLOv11](https://github.com/jahongir7174/YOLOv11-pt)
