@@ -27,7 +27,7 @@ YOLOv11-trt/
 Ensure you have [NVIDIA Docker](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html) and a compatible GPU driver installed.
 
 ```bash
-git clone https://github.com/yourusername/YOLOv11-trt.git
+git clone https://github.com/jahongir7174/YOLOv11-trt.git
 cd YOLOv11-trt
 docker-compose up --build
 ```
