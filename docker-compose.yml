@@ -8,9 +8,8 @@ services:
       context: .
     image: tensorrt:latest
     command: >
-      sh -c "nvidia-smi && 
-             cd /app && 
-             python3 main.py --onnx --engine --run"
+      sh -c "cd /app && 
+             python3 main.py --onnx --engine --benchmark --run"
     network_mode: "host"
     volumes:
       - ./data:/app/data:rw
@@ -31,5 +30,5 @@ services:
         reservations:
           devices:
             - driver: nvidia
-              count: 1
-              capabilities: [gpu]
+              device_ids: [ '1' ]
+              capabilities: [ gpu ]

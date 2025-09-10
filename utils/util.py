@@ -7,10 +7,7 @@ import onnxsim
 import tensorrt
 import torch
 
-tensorrt_version = tensorrt.__version__
-major_version = int(tensorrt_version.split('.')[0])
-minor_version = int(tensorrt_version.split('.')[1])
-total_memory = torch.cuda.get_device_properties(torch.cuda.current_device()).total_memory
+tensorrt_version = int(tensorrt.__version__.split('.')[0])
 
 
 def resize(x, h, w):
@@ -39,25 +36,77 @@ def resize(x, h, w):
     return x, r, (dw, dh)
 
 
+def make_anchors(x, strides, offset=0.5):
+    assert x is not None
+    anchor_tensor, stride_tensor = [], []
+    dtype, device = x[0].dtype, x[0].device
+    for i, stride in enumerate(strides):
+        _, _, h, w = x[i].shape
+        sx = torch.arange(end=w, device=device, dtype=dtype) + offset  # shift x
+        sy = torch.arange(end=h, device=device, dtype=dtype) + offset  # shift y
+        sy, sx = torch.meshgrid(sy, sx)
+        anchor_tensor.append(torch.stack((sx, sy), -1).view(-1, 2))
+        stride_tensor.append(torch.full((h * w, 1), stride, dtype=dtype, device=device))
+    return torch.cat(anchor_tensor), torch.cat(stride_tensor)
+
+
+class ONNXBuilder:
+    def __init__(self, args, torch_path, onnx_path, device):
+        self.args = args
+        self.device = device
+        self.model = torch.load(f=torch_path, weights_only=False, map_location='cuda')
+        self.model = self.model['model'].float().fuse().export()
+        self.model.to(device)
+
+        self.onnx_path = onnx_path
+
+    def build(self):
+        x = torch.randn((self.args.batch_size, 3, self.args.input_size, self.args.input_size))
+        x = x.to(self.device)
+        x = x.float()
+
+        for _ in range(3):
+            self.model(x)
+
+        with BytesIO() as f:
+            torch.onnx.export(self.model, x, f,
+                              opset_version=11,
+                              input_names=['images'],
+                              output_names=['num', 'boxes', 'scores', 'labels'],
+                              dynamic_axes={'images': {0: 'batch_size'},
+                                            'num': {0: 'batch_size'},
+                                            'boxes': {0: 'batch_size'},
+                                            'scores': {0: 'batch_size'},
+                                            'labels': {0: 'batch_size'}})
+            f.seek(0)
+            onnx_model = onnx.load(f)
+        onnx.checker.check_model(onnx_model)
+
+        try:
+            onnx_model, check = onnxsim.simplify(onnx_model)
+            assert check, 'assert check failed'
+        except Exception as e:
+            print(f'Simplifier failure: {e}')
+
+        onnx.save(onnx_model, self.onnx_path)
+        print(f'ONNX export success, saved as {self.onnx_path}')
+
+
 class EngineBuilder:
-    def __init__(self, onnx_path, engine_path, device):
+    def __init__(self, args, onnx_path, engine_path, device):
         self.device = device
         self.onnx_path = onnx_path
         self.engine_path = engine_path
 
-    def build(self, fp16=True, with_profiling=True):
+        self.min_batch = 1
+        self.max_batch = args.batch_size
+        self.opt_batch = args.batch_size // 2
+
+    def build(self, fp16=True):
         logger = tensorrt.Logger(tensorrt.Logger.WARNING)
         tensorrt.init_libnvinfer_plugins(logger, namespace='')
         builder = tensorrt.Builder(logger)
         config = builder.create_builder_config()
-
-        if major_version >= 10:
-            config.set_memory_pool_limit(tensorrt.MemoryPoolType.WORKSPACE, total_memory // 2)
-            config.set_memory_pool_limit(tensorrt.MemoryPoolType.DLA_MANAGED_SRAM, total_memory // 4)
-        elif major_version >= 8:
-            config.set_memory_pool_limit(tensorrt.MemoryPoolType.WORKSPACE, total_memory)
-        else:
-            config.max_workspace_size = total_memory
 
         flag = (1 << int(tensorrt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH))
         network = builder.create_network(flag)
@@ -65,21 +114,19 @@ class EngineBuilder:
         self.logger = logger
         self.builder = builder
         self.network = network
+        self.config = config  # Store config for use in build_from_onnx
 
         self.build_from_onnx()
+
+        # Add the profile if it was created in build_from_onnx
+        if hasattr(self, 'profile'):
+            config.add_optimization_profile(self.profile)
 
         if fp16 and self.builder.platform_has_fast_fp16:
             config.set_flag(tensorrt.BuilderFlag.FP16)
 
-        if with_profiling:
-            if major_version <= 8:
-                config.profiling_verbosity = tensorrt.ProfilingVerbosity.VERBOSE
-            else:
-                config.profiling_verbosity = tensorrt.ProfilingVerbosity.DETAILED
-
-        if major_version >= 8:
-            serialized_engine = builder.build_serialized_network(
-                network, config)
+        if tensorrt_version >= 8:
+            serialized_engine = builder.build_serialized_network(network, config)
             if serialized_engine is None:
                 raise RuntimeError('Failed to build serialized engine')
             with tensorrt.Runtime(logger) as runtime:
@@ -92,9 +139,9 @@ class EngineBuilder:
         if engine is not None:
             with open(self.engine_path, 'wb') as f:
                 f.write(engine.serialize())
-            self.logger.log(
-                tensorrt.Logger.WARNING, f'Build TensorRT engine finished.\n'
-                                         f'Saved to {str(self.engine_path)}')
+            self.logger.log(tensorrt.Logger.WARNING,
+                            msg=f'Build TensorRT engine finished.\n'
+                                f'Saved to {str(self.engine_path)}')
         else:
             raise RuntimeError('Engine creation failed')
 
@@ -104,18 +151,40 @@ class EngineBuilder:
 
         if not parser.parse(onnx_model.SerializeToString()):
             raise RuntimeError(f'Failed to load ONNX file: {str(self.onnx_path)}')
+
         inputs = [self.network.get_input(i) for i in range(self.network.num_inputs)]
         outputs = [self.network.get_output(i) for i in range(self.network.num_outputs)]
 
-        for inp in inputs:
+        # Set up optimization profiles for dynamic batch size
+        for i in inputs:
             self.logger.log(tensorrt.Logger.WARNING,
-                            f'input "{inp.name}" with shape: {inp.shape} dtype: {inp.dtype}')
-        for out in outputs:
+                            f'input "{i.name}" with shape: {i.shape} dtype: {i.dtype}')
+
+            # Check if input has dynamic batch dimension (first dimension is -1)
+            if i.shape[0] == -1:
+                self.logger.log(tensorrt.Logger.WARNING, f'Setting up dynamic batch profile for {i.name}')
+
+                # Create optimization profile for dynamic batching
+                self.profile = self.builder.create_optimization_profile()
+
+                # Get the static dimensions (all except batch)
+                static_shape = i.shape[1:]
+
+                # Set min, opt, max shapes with different batch sizes
+                min_shape = (self.min_batch,) + static_shape
+                opt_shape = (self.opt_batch,) + static_shape
+                max_shape = (self.max_batch,) + static_shape
+
+                self.profile.set_shape(i.name, min_shape, opt_shape, max_shape)
+                self.logger.log(tensorrt.Logger.WARNING,
+                                f'Profile set: min={min_shape}, opt={opt_shape}, max={max_shape}')
+
+        for i in outputs:
             self.logger.log(tensorrt.Logger.WARNING,
-                            f'output "{out.name}" with shape: {out.shape} dtype: {out.dtype}')
+                            f'output "{i.name}" with shape: {i.shape} dtype: {i.dtype}')
 
 
-class TRTModule(torch.nn.Module):
+class TRTModule:
     dtypeMapping = {tensorrt.bool: torch.bool,
                     tensorrt.int8: torch.int8,
                     tensorrt.int32: torch.int32,
@@ -124,11 +193,28 @@ class TRTModule(torch.nn.Module):
 
     def __init__(self, engine_path, device):
         super().__init__()
+        self.device = device
         self.weight = engine_path
-        self.device = device if device is not None else torch.device('cuda:0')
         self.stream = torch.cuda.Stream(device=self.device)
+
+        # Set CUDA context
+        torch.cuda.set_device(self.device)
+
         self.__init_engine()
         self.__init_bindings()
+
+    def __del__(self):
+        try:
+            if hasattr(self, 'context'):
+                del self.context
+            if hasattr(self, 'model'):
+                del self.model
+            if hasattr(self, 'stream'):
+                self.stream.synchronize()
+                del self.stream
+            torch.cuda.empty_cache()
+        except Exception as e:
+            pass  # Ignore cleanup errors during shutdown
 
     def __init_engine(self) -> None:
         logger = tensorrt.Logger(tensorrt.Logger.WARNING)
@@ -139,7 +225,7 @@ class TRTModule(torch.nn.Module):
 
         context = model.create_execution_context()
 
-        if major_version >= 10:
+        if tensorrt_version >= 10:
             num_io_tensors = model.num_io_tensors
             names = [model.get_tensor_name(i) for i in range(num_io_tensors)]
             num_inputs = sum(1 for name in names if model.get_tensor_mode(name) == tensorrt.TensorIOMode.INPUT)
@@ -158,15 +244,15 @@ class TRTModule(torch.nn.Module):
         self.context = context
         self.input_names = names[:num_inputs]
         self.output_names = names[num_inputs:]
-        self.idx = list(range(self.num_outputs))
+        self.indices = list(range(self.num_outputs))
 
     def __init_bindings(self) -> None:
         i_dynamic = o_dynamic = False
         Tensor = namedtuple('Tensor', ('name', 'dtype', 'shape'))
-        inp_info = []
-        out_info = []
+        input_info = []
+        output_info = []
         for i, name in enumerate(self.input_names):
-            if major_version >= 10:
+            if tensorrt_version >= 10:
                 dtype = self.dtypeMapping[self.model.get_tensor_dtype(name)]
                 shape = tuple(self.model.get_tensor_shape(name))
             else:
@@ -175,10 +261,10 @@ class TRTModule(torch.nn.Module):
                 shape = tuple(self.model.get_binding_shape(i))
             if -1 in shape:
                 i_dynamic |= True
-            inp_info.append(Tensor(name, dtype, shape))
+            input_info.append(Tensor(name, dtype, shape))
         for i, name in enumerate(self.output_names):
             j = i + self.num_inputs
-            if major_version >= 10:
+            if tensorrt_version >= 10:
                 dtype = self.dtypeMapping[self.model.get_tensor_dtype(name)]
                 shape = tuple(self.model.get_tensor_shape(name))
             else:
@@ -187,40 +273,41 @@ class TRTModule(torch.nn.Module):
                 shape = tuple(self.model.get_binding_shape(j))
             if -1 in shape:
                 o_dynamic |= True
-            out_info.append(Tensor(name, dtype, shape))
+            output_info.append(Tensor(name, dtype, shape))
 
         if not o_dynamic:
             self.output_tensor = [torch.empty(info.shape, dtype=info.dtype, device=self.device)
-                                  for info in out_info]
+                                  for info in output_info]
         self.i_dynamic = i_dynamic
         self.o_dynamic = o_dynamic
-        self.inp_info = inp_info
-        self.out_info = out_info
+        self.input_info = input_info
+        self.output_info = output_info
 
     def set_profiler(self, profiler):
-        self.context.profiler = profiler if profiler is not None else \
-            tensorrt.Profiler()
+        self.context.profiler = profiler if profiler is not None else tensorrt.Profiler()
 
     def set_desired(self, desired):
         if isinstance(desired, (list, tuple)) and len(desired) == self.num_outputs:
-            self.idx = [self.output_names.index(i) for i in desired]
+            self.indices = [self.output_names.index(i) for i in desired]
 
-    def forward(self, *inputs):
-        assert len(inputs) == self.num_inputs
-        contiguous_inputs = [i.contiguous() for i in inputs]
+    def __call__(self, *inputs):
+        # Ensure we're on the correct device
+        torch.cuda.set_device(self.device)
 
-        if major_version >= 10:
+        inputs = [i.contiguous() for i in inputs]
+
+        if tensorrt_version >= 10:
             for i, name in enumerate(self.input_names):
-                self.context.set_tensor_address(name, contiguous_inputs[i].data_ptr())
+                self.context.set_tensor_address(name, inputs[i].data_ptr())
                 if self.i_dynamic:
-                    self.context.set_input_shape(name, tuple(contiguous_inputs[i].shape))
+                    self.context.set_input_shape(name, tuple(inputs[i].shape))
 
             outputs = []
             for i, name in enumerate(self.output_names):
                 if self.o_dynamic:
                     shape = tuple(self.context.get_tensor_shape(name))
                     output = torch.empty(size=shape,
-                                         dtype=self.out_info[i].dtype,
+                                         dtype=self.output_info[i].dtype,
                                          device=self.device)
                 else:
                     output = self.output_tensor[i]
@@ -232,9 +319,9 @@ class TRTModule(torch.nn.Module):
                 raise RuntimeError('TensorRT execution failed')
         else:
             for i in range(self.num_inputs):
-                self.bindings[i] = contiguous_inputs[i].data_ptr()
+                self.bindings[i] = inputs[i].data_ptr()
                 if self.i_dynamic:
-                    self.context.set_binding_shape(i, tuple(contiguous_inputs[i].shape))
+                    self.context.set_binding_shape(i, tuple(inputs[i].shape))
 
             outputs = []
             for i in range(self.num_outputs):
@@ -242,7 +329,7 @@ class TRTModule(torch.nn.Module):
                 if self.o_dynamic:
                     shape = tuple(self.context.get_binding_shape(j))
                     output = torch.empty(size=shape,
-                                         dtype=self.out_info[i].dtype,
+                                         dtype=self.output_info[i].dtype,
                                          device=self.device)
                 else:
                     output = self.output_tensor[i]
@@ -254,55 +341,14 @@ class TRTModule(torch.nn.Module):
 
         self.stream.synchronize()
 
-        return tuple(outputs[i] for i in self.idx) if len(outputs) > 1 else outputs[0]
+        return tuple(outputs[i] for i in self.indices) if len(outputs) > 1 else outputs[0]
 
 
-def to_onnx(device, torch_path, onnx_path):
-    b = 1
-    size = 640
-
-    model = torch.load(f=torch_path, weights_only=False, map_location='cuda')
-    model = model['model'].float().fuse().export()
-    model.to(device)
-
-    x = torch.randn((b, 3, size, size)).to(device)
-    for _ in range(2):
-        model(x)
-    with BytesIO() as f:
-        torch.onnx.export(model,
-                          x,
-                          f,
-                          opset_version=11,
-                          input_names=['images'],
-                          output_names=['num', 'boxes', 'scores', 'labels'])
-        f.seek(0)
-        onnx_model = onnx.load(f)
-    onnx.checker.check_model(onnx_model)
-
-    try:
-        onnx_model, check = onnxsim.simplify(onnx_model)
-        assert check, 'assert check failed'
-    except Exception as e:
-        print(f'Simplifier failure: {e}')
-
-    onnx.save(onnx_model, onnx_path)
-    print(f'ONNX export success, saved as {onnx_path}')
+def to_onnx(device, args, torch_path, onnx_path):
+    builder = ONNXBuilder(args, torch_path, onnx_path, device)
+    builder.build()
 
 
-def to_engine(device, onnx_path, engine_path):
-    builder = EngineBuilder(onnx_path, engine_path, device)
+def to_engine(device, args, onnx_path, engine_path):
+    builder = EngineBuilder(args, onnx_path, engine_path, device)
     builder.build(fp16=True)
-
-
-def make_anchors(x, strides, offset=0.5):
-    assert x is not None
-    anchor_tensor, stride_tensor = [], []
-    dtype, device = x[0].dtype, x[0].device
-    for i, stride in enumerate(strides):
-        _, _, h, w = x[i].shape
-        sx = torch.arange(end=w, device=device, dtype=dtype) + offset  # shift x
-        sy = torch.arange(end=h, device=device, dtype=dtype) + offset  # shift y
-        sy, sx = torch.meshgrid(sy, sx)
-        anchor_tensor.append(torch.stack((sx, sy), -1).view(-1, 2))
-        stride_tensor.append(torch.full((h * w, 1), stride, dtype=dtype, device=device))
-    return torch.cat(anchor_tensor), torch.cat(stride_tensor)

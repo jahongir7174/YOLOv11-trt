@@ -14,15 +14,18 @@ from utils import util
 warnings.filterwarnings("ignore")
 
 
-def latency(device, engine_path):
+def benchmark(args, device, engine_path):
     engine = util.TRTModule(engine_path, device)
 
     # warming up
     import time
-    x = torch.randn((1, 3, 640, 640), dtype=torch.float16, device=device)
-    for _ in range(10):
+    x = torch.randn((args.batch_size, 3, args.input_size, args.input_size))
+    x = x.to(device)
+    x = x.float()
+    for _ in range(3):
         engine(x)
-    n = 10_000
+
+    n = 1_000
     start = time.perf_counter()
     for _ in range(n):
         engine(x)
@@ -30,6 +33,7 @@ def latency(device, engine_path):
 
     fps = int(1 / ((end - start) / n))
     print('FPS:', fps)
+    print('FPS per image:', fps * args.batch_size)
 
 
 def run(args, params, device, engine_path):
@@ -115,14 +119,13 @@ def run(args, params, device, engine_path):
                                   (0, 0, 255), -1)
                     cv2.putText(frame, text, (x1, _y1 + _h), cv2.FONT_HERSHEY_SIMPLEX,
                                 0.75, (255, 255, 255), 2)
-        os.makedirs(name='./outputs', exist_ok=True)
         cv2.imwrite(f'./outputs/{filename}', frame)
 
 
 def main():
     parser = ArgumentParser()
     parser.add_argument('--input-size', default=640, type=int)
-    parser.add_argument('--batch-size', default=1, type=int)
+    parser.add_argument('--batch-size', default=32, type=int)
     parser.add_argument('--benchmark', action='store_true')
     parser.add_argument('--engine', action='store_true')
     parser.add_argument('--onnx', action='store_true')
@@ -139,14 +142,17 @@ def main():
     engine_path = './weights/v11_n.engine'
 
     if args.onnx:
-        util.to_onnx(device, model_path, onnx_path)
+        util.to_onnx(device, args, model_path, onnx_path)
     time.sleep(1)
+
     if args.engine:
-        util.to_engine(device, onnx_path, engine_path)
+        util.to_engine(device, args, onnx_path, engine_path)
     time.sleep(1)
+
     if args.benchmark:
-        latency(device, engine_path)
+        benchmark(args, device, engine_path)
     time.sleep(1)
+
     if args.run:
         run(args, params, device, engine_path)
 
